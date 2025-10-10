@@ -111,7 +111,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     input_t *Bvar = reinterpret_cast<input_t *>(params.B_ptr) + batch_id * params.B_batch_stride + group_id * params.B_group_stride;
     weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * kNRows * params.C_d_stride;
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
-    scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
+    scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate * 2;
 
     float D_val[kNRows] = {0};
     if (params.D_ptr != nullptr) {
@@ -214,49 +214,102 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             #pragma unroll
             for (int r = 0; r < kNRows; ++r) {
                 if (r > 0) { __syncthreads(); }  // Scan could be using the same smem
+                
+                // Stage 1: Velocity scan - v_t = beta * v_{t-1} + alpha * B_t * x_t
+                scan_t velocity_data[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    if constexpr (!kIsComplex) {
+                        float B_delta_u = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
+                        velocity_data[i] = make_float2(params.beta, params.alpha * B_delta_u);
+                        if constexpr (!Ktraits::kIsEvenLen) {
+                            if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
+                                velocity_data[i] = make_float2(1.f, 0.f);
+                            }
+                        }
+                    } else {
+                        weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
+                        velocity_data[i] = make_float4(params.beta, 0.f, 
+                                                       params.alpha * B_delta_u_val.real_, 
+                                                       params.alpha * B_delta_u_val.imag_);
+                        if constexpr (!Ktraits::kIsEvenLen) {
+                            if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
+                                velocity_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
+                            }
+                        }
+                    }
+                }
+                
+                // Velocity running prefix (stored in even indices of x: 0, 2, 4...)
+                scan_t velocity_running_prefix;
+                if constexpr (!kIsComplex) {
+                    velocity_running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
+                        x[(r * params.n_chunks + chunk - 1) * params.dstate * 2 + state_idx * 2] :
+                        make_float2(1.f, 0.f);
+                } else {
+                    velocity_running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
+                        x[(r * params.n_chunks + chunk - 1) * params.dstate * 2 + state_idx * 2] :
+                        make_float4(1.f, 0.f, 0.f, 0.f);
+                }
+                SSMScanPrefixCallbackOp<weight_t> velocity_prefix_op(velocity_running_prefix);
+                typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
+                    velocity_data, velocity_data, SSMScanOp<weight_t>(), velocity_prefix_op
+                );
+                
+                // Store velocity state
+                if (threadIdx.x == 0) {
+                    x[(r * params.n_chunks + chunk) * params.dstate * 2 + state_idx * 2] = 
+                        velocity_prefix_op.running_prefix;
+                }
+                
+                __syncthreads();  // Sync before second scan
+                
+                // Stage 2: Hidden state scan - h_t = A_t * h_{t-1} + v_t
                 scan_t thread_data[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     if constexpr (!kIsComplex) {
-                        thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
-                                                     !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
-                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
+                        // Use velocity from stage 1 as the input
+                        thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]), velocity_data[i].y);
+                        if constexpr (!Ktraits::kIsEvenLen) {
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 thread_data[i] = make_float2(1.f, 0.f);
                             }
                         }
                     } else {
-                        // Pytorch's implementation of complex exp (which calls thrust) is very slow
                         complex_t delta_a_exp = cexp2f(delta_vals[r][i] * A_val[r]);
-                        weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
-                        thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
-                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
+                        thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, 
+                                                     velocity_data[i].z, velocity_data[i].w);
+                        if constexpr (!Ktraits::kIsEvenLen) {
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 thread_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
                             }
                         }
                     }
                 }
-                // Initialize running total
+                
+                // Hidden state running prefix (stored in odd indices: 1, 3, 5...)
                 scan_t running_prefix;
                 if constexpr (!kIsComplex) {
-                    // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
-                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float2(1.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
+                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
+                        x[(r * params.n_chunks + chunk - 1) * params.dstate * 2 + state_idx * 2 + 1] :
+                        make_float2(1.f, 0.f);
                 } else {
-                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float4(1.f, 0.f, 0.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
+                    running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
+                        x[(r * params.n_chunks + chunk - 1) * params.dstate * 2 + state_idx * 2 + 1] :
+                        make_float4(1.f, 0.f, 0.f, 0.f);
                 }
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
                 typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
                     thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
                 );
-                // There's a syncthreads in the scan op, so we don't need to sync here.
-                // Unless there's only 1 warp, but then it's the same thread (0) reading and writing.
+                
+                // Store hidden state
                 if (threadIdx.x == 0) {
-                    smem_running_prefix[state_idx] = prefix_op.running_prefix;
-                    x[(r * params.n_chunks + chunk) * params.dstate + state_idx] = prefix_op.running_prefix;
+                    x[(r * params.n_chunks + chunk) * params.dstate * 2 + state_idx * 2 + 1] = 
+                        prefix_op.running_prefix;
                 }
+                
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     const weight_t C_val = !kIsVariableC

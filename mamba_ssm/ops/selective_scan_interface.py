@@ -22,7 +22,7 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                return_last_state=False):
+                return_last_state=False, beta=None, alpha=None):
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -41,17 +41,41 @@ class SelectiveScanFn(torch.autograd.Function):
         if C.dim() == 3:
             C = rearrange(C, "b dstate l -> b 1 dstate l")
             ctx.squeeze_C = True
-        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
+        
+        # Set default values for momentum parameters
+        if beta is None:
+            beta = 0.0  # No momentum by default
+        if alpha is None:
+            alpha = 1.0
+        
+        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus, 
+                                                 float(beta), float(alpha))
         ctx.delta_softplus = delta_softplus
         ctx.has_z = z is not None
-        last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
+        ctx.beta = beta
+        ctx.alpha = alpha
+        
+        # Extract states from x tensor
+        # x has shape (batch, dim, n_chunks, dstate * 4) of floats
+        # This represents (batch, dim, n_chunks, dstate * 2) of float2 values
+        # Reshape to separate float2 components (a, b)
+        batch, dim, n_chunks, _ = x.shape
+        dstate = A.shape[-1]
+        x_reshaped = x.view(batch, dim, n_chunks, dstate * 2, 2)  # (batch, dim, n_chunks, dstate*2, 2)
+        
+        # Take the 'b' component (index 1) which contains the state values
+        states = x_reshaped[:, :, -1, :, 1]  # (batch, dim, dstate * 2)
+        
+        # Even indices: velocity states, Odd indices: hidden states
+        last_velocity = states[:, :, 0::2]  # (batch, dim, dstate)
+        last_state = states[:, :, 1::2]  # (batch, dim, dstate)
         if not ctx.has_z:
             ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, x)
-            return out if not return_last_state else (out, last_state)
+            return out if not return_last_state else (out, last_state, last_velocity)
         else:
             ctx.save_for_backward(u, delta, A, B, C, D, z, delta_bias, x, out)
             out_z = rest[0]
-            return out_z if not return_last_state else (out_z, last_state)
+            return out_z if not return_last_state else (out_z, last_state, last_velocity)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -68,7 +92,8 @@ class SelectiveScanFn(torch.autograd.Function):
         # Here we just pass in None and dz will be allocated in the C++ code.
         du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
             u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
-            False  # option to recompute out_z, not used here
+            False,  # option to recompute out_z, not used here
+            float(ctx.beta), float(ctx.alpha)
         )
         dz = rest[0] if ctx.has_z else None
         dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) else dB
@@ -78,7 +103,9 @@ class SelectiveScanFn(torch.autograd.Function):
                 dz,
                 ddelta_bias if delta_bias is not None else None,
                 None,
-                None)
+                None,
+                None,  # dbeta (not computed, beta is fixed)
+                None)  # dalpha (not computed, alpha is fixed)
 
 
 def rms_norm_forward(
@@ -102,16 +129,18 @@ def rms_norm_forward(
 
 
 def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                     return_last_state=False):
-    """if return_last_state is True, returns (out, last_state)
+                     return_last_state=False, beta=None, alpha=None):
+    """if return_last_state is True, returns (out, last_state, last_velocity)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
+    beta: momentum decay parameter (scalar)
+    alpha: momentum scale parameter (scalar)
     """
-    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state, beta, alpha)
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                      return_last_state=False):
+                      return_last_state=False, beta=0.0, alpha=1.0):
     """
     u: r(B D L)
     delta: r(B D L)
@@ -121,9 +150,12 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     D: r(D)
     z: r(B D L)
     delta_bias: r(D), fp32
+    beta: momentum decay (scalar)
+    alpha: momentum scale (scalar)
 
     out: r(B D L)
     last_state (optional): r(B D dstate) or c(B D dstate)
+    last_velocity (optional): r(B D dstate) or c(B D dstate)
     """
     dtype_in = u.dtype
     u = u.float()
@@ -144,6 +176,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
         B = B.float()
         C = C.float()
     x = A.new_zeros((batch, dim, dstate))
+    v = A.new_zeros((batch, dim, dstate))  # velocity state
     ys = []
     deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
     if not is_variable_B:
@@ -157,8 +190,12 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if is_variable_C and C.dim() == 4:
         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
     last_state = None
+    last_velocity = None
     for i in range(u.shape[2]):
-        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+        # Momentum: v_t = beta * v_{t-1} + alpha * B_t * x_t
+        v = beta * v + alpha * deltaB_u[:, :, i]
+        # Hidden state: h_t = A_t * h_{t-1} + v_t
+        x = deltaA[:, :, i] * x + v
         if not is_variable_C:
             y = torch.einsum('bdn,dn->bd', x, C)
         else:
@@ -168,6 +205,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
                 y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
         if i == u.shape[2] - 1:
             last_state = x
+            last_velocity = v
         if y.is_complex():
             y = y.real * 2
         ys.append(y)
@@ -176,7 +214,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if z is not None:
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
-    return out if not return_last_state else (out, last_state)
+    return out if not return_last_state else (out, last_state, last_velocity)
 
 
 class MambaInnerFn(torch.autograd.Function):

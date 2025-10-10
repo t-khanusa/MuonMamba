@@ -139,7 +139,7 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     float delta_bias = params.delta_bias_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.delta_bias_ptr)[dim_id];
     scan_t *x = params.x_ptr == nullptr
         ? nullptr
-        : reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id) * (params.n_chunks) * params.dstate;
+        : reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id) * (params.n_chunks) * params.dstate * 2;  // *2 for momentum (velocity + hidden states)
     float dD_val = 0;
     float ddelta_bias_val = 0;
 
@@ -247,11 +247,39 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             }
             // const weight_t A_val = smem_a[state_idx];
             scan_t thread_data[kNItems], thread_reverse_data[kNItems];
+            
             if constexpr (!kIsComplex) {
+                // Step 1: Reconstruct velocity scan to get v_t values
+                scan_t velocity_data[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    float B_delta_u = !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i];
+                    velocity_data[i] = make_float2(params.beta, params.alpha * B_delta_u);
+                }
+                // Load velocity running prefix from even indices
+                scan_t v_running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
+                    x[(chunk - 1) * params.dstate * 2 + state_idx * 2] : 
+                    make_float2(1.f, 0.f);
+                SSMScanPrefixCallbackOp<weight_t> v_prefix_op(v_running_prefix);
+                typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
+                    velocity_data, velocity_data, SSMScanOp<weight_t>(), v_prefix_op
+                );
+                
+                // Save v_t values (output of velocity scan)
+                float v_t_vals[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    v_t_vals[i] = velocity_data[i].y;
+                }
+                
+                __syncthreads();  // Sync before reusing smem_scan
+                
+                // Step 2: Reconstruct hidden state scan to get h_t values
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     const float delta_a_exp = exp2f(delta_vals[i] * A_scaled);
-                    thread_data[i] = make_float2(delta_a_exp, !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
+                    // Use v_t (output of velocity scan) as input to hidden state scan
+                    thread_data[i] = make_float2(delta_a_exp, v_t_vals[i]);
                     if (i == 0) {
                         smem_delta_a[threadIdx.x == 0 ? state_idx + (chunk % 2) * MAX_DSTATE : threadIdx.x + 2 * MAX_DSTATE] = delta_a_exp;
                     } else {
@@ -266,38 +294,77 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 thread_reverse_data[kNItems - 1].x = threadIdx.x == kNThreads - 1
                     ? (chunk == params.n_chunks - 1 ? 1.f : smem_delta_a[state_idx + ((chunk + 1) % 2) * MAX_DSTATE])
                     : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
-                // Initialize running total
-                scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float2(1.f, 0.f);
+                // Initialize running total - access hidden state (odd index) from previous chunk
+                scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate * 2 + state_idx * 2 + 1] : make_float2(1.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
                 typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
                     thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
                 );
-                scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx] : make_float2(1.f, 0.f);
+                scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx * 2] : make_float2(1.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> postfix_op(running_postfix);
                 typename Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
                     thread_reverse_data, thread_reverse_data, SSMScanOp<weight_t>(), postfix_op
                 );
-                if (threadIdx.x == 0) { smem_running_postfix[state_idx] = postfix_op.running_prefix; }
+                if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2] = postfix_op.running_prefix; }
+                
+                // Step 3: Reverse scan through velocity to get correct gradients
+                // Velocity equation: v_t = β·v_{t-1} + α·B·δ·u
+                // Gradient flows backward: dv_{t-1} = β·dv_t
+                scan_t dv_reverse_data[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    const float dx = thread_reverse_data[i].y;  // ∂L/∂h_t = ∂L/∂v_t (since h_t = ... + v_t)
+                    dv_reverse_data[i] = make_float2(params.beta, dx);  // (β, gradient)
+                }
+                
+                // Reverse scan for velocity gradients (interleave with hidden state in smem)
+                scan_t dv_running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? 
+                    smem_running_postfix[state_idx * 2 + 1] : make_float2(1.f, 0.f);
+                SSMScanPrefixCallbackOp<weight_t> dv_postfix_op(dv_running_postfix);
+                __syncthreads();  // Sync before reusing smem_reverse_scan
+                typename Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
+                    dv_reverse_data, dv_reverse_data, SSMScanOp<weight_t>(), dv_postfix_op
+                );
+                // Save velocity gradient postfix for next chunk (interleave: state_idx*2+1)
+                if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2 + 1] = dv_postfix_op.running_prefix; }
+                
+                // Step 4: Compute gradients using correct v_t and dv values
                 weight_t dA_val = 0, dBC_val = 0;
                 weight_t dB_vals[kNItems], dC_vals[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
-                    const float dx = thread_reverse_data[i].y;
-                    const float ddelta_u = !kIsVariableB ? dx : dx * B_vals[i];
+                    const float dx = thread_reverse_data[i].y;  // ∂L/∂h_t
+                    const float dv = dv_reverse_data[i].y;  // ∂L/∂(α·B·δ·u) after velocity reverse scan
+                    const float h_t = thread_data[i].y;  // h_t (output of hidden state scan)
+                    const float v_t = v_t_vals[i];  // Output of velocity scan
+                    
+                    // KEY: exp(δ·A)·h_{t-1} = h_t - v_t (from forward pass)
+                    const float h_t_minus_v_t = h_t - v_t;  // exp(δ·A)·h_{t-1}
+                    
+                    // Gradients (using correct chain rule with velocity reverse scan)
+                    // ∂L/∂(B·δ·u) = dv · α
+                    const float ddelta_u = !kIsVariableB ? (dv * params.alpha) : (dv * params.alpha * B_vals[i]);
+                    const float ddelta_from_v = ddelta_u * float(u_vals[i]);  // Through velocity path
+                    const float ddelta_from_exp = dx * A_val * h_t_minus_v_t;  // Through exp term
+                    
                     du_vals[i] += ddelta_u * delta_vals[i];
-                    const float a = thread_data[i].y - (!kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]);
-                    ddelta_vals[i] += ddelta_u * float(u_vals[i]) + dx * A_val * a;
-                    dA_val += dx * delta_vals[i] * a;
+                    ddelta_vals[i] += ddelta_from_v + ddelta_from_exp;
+                    
+                    // ∂L/∂A = dx · δ · (h_t - v_t)
+                    dA_val += dx * delta_vals[i] * h_t_minus_v_t;
+                    
                     if constexpr (!kIsVariableB || !kIsVariableC) {
                         if constexpr (!kIsVariableB) {  // dBC_val is dB_val
-                            dBC_val += dout_vals[i] * (!kIsVariableC ? thread_data[i].y : thread_data[i].y * C_vals[i]);
+                            dBC_val += dout_vals[i] * (!kIsVariableC ? h_t : h_t * C_vals[i]);
                         } else {  // dBC_val is dC_val
-                            dBC_val += dout_vals[i] * thread_data[i].y;
+                            dBC_val += dout_vals[i] * h_t;
                         }
                     }
-                    if constexpr (kIsVariableB) { dB_vals[i] = dx * delta_vals[i] * float(u_vals[i]); }
+                    if constexpr (kIsVariableB) {
+                        dB_vals[i] = dv * params.alpha * delta_vals[i] * float(u_vals[i]);
+                    }
                     if constexpr (kIsVariableC) {
-                        dC_vals[i] = dout_vals[i] * (!kIsVariableB ? thread_data[i].y * B_val : thread_data[i].y);
+                        dC_vals[i] = dout_vals[i] * (!kIsVariableB ? h_t * B_val : h_t);
                     }
                 }
                 // Block-exchange to make the atomicAdd's coalesced, otherwise they're much slower
@@ -334,12 +401,40 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     smem_da[state_idx] = chunk == params.n_chunks - 1 ? dA_val : dA_val + smem_da[state_idx];
                 }
             } else {
+                // Step 1: Reconstruct velocity scan to get v_t values (complex case)
+                scan_t velocity_data[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    weight_t B_delta_u_val = !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : B_vals[i] * delta_vals[i] * float(u_vals[i]);
+                    velocity_data[i] = make_float4(params.beta, 0.f, 
+                                                   params.alpha * B_delta_u_val.real_, 
+                                                   params.alpha * B_delta_u_val.imag_);
+                }
+                // Load velocity running prefix from even indices
+                scan_t v_running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
+                    x[(chunk - 1) * params.dstate * 2 + state_idx * 2] : 
+                    make_float4(1.f, 0.f, 0.f, 0.f);
+                SSMScanPrefixCallbackOp<weight_t> v_prefix_op(v_running_prefix);
+                typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
+                    velocity_data, velocity_data, SSMScanOp<weight_t>(), v_prefix_op
+                );
+                
+                // Save v_t values (output of velocity scan)
+                weight_t v_t_vals[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    v_t_vals[i] = complex_t(velocity_data[i].z, velocity_data[i].w);
+                }
+                
+                __syncthreads();  // Sync before reusing smem_scan
+                
+                // Step 2: Reconstruct hidden state scan to get h_t values
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     // Pytorch's implementation of complex exp (which calls thrust) is very slow
                     complex_t delta_a_exp = cexp2f(delta_vals[i] * A_scaled);
-                    weight_t B_delta_u_val = !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : B_vals[i] * delta_vals[i] * float(u_vals[i]);
-                    thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
+                    // Use v_t (output of velocity scan) as input to hidden state scan
+                    thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, v_t_vals[i].real_, v_t_vals[i].imag_);
                     if (i == 0) {
                         smem_delta_a[threadIdx.x == 0 ? state_idx + (chunk % 2) * MAX_DSTATE : threadIdx.x + 2 * MAX_DSTATE] = delta_a_exp;
                     } else {
@@ -359,39 +454,79 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     : smem_delta_a[threadIdx.x + 1 + 2 * MAX_DSTATE];
                 thread_reverse_data[kNItems - 1].x = delta_a_exp.real_;
                 thread_reverse_data[kNItems - 1].y = -delta_a_exp.imag_;
-                // Initialize running total
-                scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate + state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
+                // Initialize running total - access hidden state (odd index) from previous chunk
+                scan_t running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? x[(chunk - 1) * params.dstate * 2 + state_idx * 2 + 1] : make_float4(1.f, 0.f, 0.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
                 typename Ktraits::BlockScanT(smem_scan).InclusiveScan(
                     thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
                 );
-                scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
+                scan_t running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? smem_running_postfix[state_idx * 2] : make_float4(1.f, 0.f, 0.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> postfix_op(running_postfix);
                 typename Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
                     thread_reverse_data, thread_reverse_data, SSMScanOp<weight_t>(), postfix_op
                 );
-                if (threadIdx.x == 0) { smem_running_postfix[state_idx] = postfix_op.running_prefix; }
+                if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2] = postfix_op.running_prefix; }
+                
+                // Step 3: Reverse scan through velocity to get correct gradients (complex case)
+                // Velocity equation: v_t = β·v_{t-1} + α·B·δ·u
+                // Gradient flows backward: dv_{t-1} = β·dv_t
+                scan_t dv_reverse_data[kNItems];
+                #pragma unroll
+                for (int i = 0; i < kNItems; ++i) {
+                    complex_t dx = complex_t(thread_reverse_data[i].z, thread_reverse_data[i].w);  // ∂L/∂h_t = ∂L/∂v_t
+                    dv_reverse_data[i] = make_float4(params.beta, 0.f, dx.real_, dx.imag_);  // (β, 0, gradient)
+                }
+                
+                // Reverse scan for velocity gradients (interleave with hidden state in smem)
+                scan_t dv_running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? 
+                    smem_running_postfix[state_idx * 2 + 1] : make_float4(1.f, 0.f, 0.f, 0.f);
+                SSMScanPrefixCallbackOp<weight_t> dv_postfix_op(dv_running_postfix);
+                __syncthreads();  // Sync before reusing smem_reverse_scan
+                typename Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
+                    dv_reverse_data, dv_reverse_data, SSMScanOp<weight_t>(), dv_postfix_op
+                );
+                // Save velocity gradient postfix for next chunk (interleave: state_idx*2+1)
+                if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2 + 1] = dv_postfix_op.running_prefix; }
+                
+                // Step 4: Compute gradients using correct v_t and dv values
                 weight_t dA_val = 0, dBC_val = 0;
                 weight_t dB_vals[kNItems], dC_vals[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
-                    complex_t x = complex_t(thread_data[i].z, thread_data[i].w);
-                    complex_t dx = complex_t(thread_reverse_data[i].z, thread_reverse_data[i].w);
-                    float ddelta_u = !kIsVariableB ? dx.real_ : (dx * conj(B_vals[i])).real_;
+                    complex_t h_t = complex_t(thread_data[i].z, thread_data[i].w);  // h_t (output of hidden state scan)
+                    complex_t dx = complex_t(thread_reverse_data[i].z, thread_reverse_data[i].w);  // ∂L/∂h_t
+                    complex_t dv = complex_t(dv_reverse_data[i].z, dv_reverse_data[i].w);  // ∂L/∂(α·B·δ·u) after velocity reverse scan
+                    complex_t v_t = v_t_vals[i];  // Output of velocity scan
+                    
+                    // KEY: exp(δ·A)·h_{t-1} = h_t - v_t (from forward pass)
+                    complex_t h_t_minus_v_t = h_t - v_t;  // exp(δ·A)·h_{t-1}
+                    complex_t h_t_minus_v_t_conj = conj(h_t_minus_v_t);
+                    
+                    // Gradients (using correct chain rule with velocity reverse scan)
+                    // ∂L/∂(B·δ·u) = dv · α
+                    float ddelta_u = !kIsVariableB ? (dv.real_ * params.alpha) : ((dv * conj(B_vals[i])).real_ * params.alpha);
+                    float ddelta_from_v = ddelta_u * float(u_vals[i]);  // Through velocity path
+                    float ddelta_from_exp = (dx * conj(A_val) * h_t_minus_v_t_conj).real_;  // Through exp term
+                    
                     if constexpr (!kIsVariableB || !kIsVariableC) {
                         if constexpr (!kIsVariableB) {  // dBC_val is dB_val
-                            dBC_val += (2 * dout_vals[i]) * conj(!kIsVariableC ? x : x * C_vals[i]);
+                            dBC_val += (2 * dout_vals[i]) * conj(!kIsVariableC ? h_t : h_t * C_vals[i]);
                         } else {  // dBC_val is dC_val
-                            dBC_val += (2 * dout_vals[i]) * conj(x);
+                            dBC_val += (2 * dout_vals[i]) * conj(h_t);
                         }
                     }
-                    const complex_t a_conj = conj(x - (!kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i]));
+                    
                     du_vals[i] += ddelta_u * delta_vals[i];
-                    ddelta_vals[i] += ddelta_u * float(u_vals[i]) + (dx * conj(A_val) * a_conj).real_;
-                    dA_val += delta_vals[i] * dx * a_conj;
-                    if constexpr (kIsVariableB) { dB_vals[i] = dx * delta_vals[i] * float(u_vals[i]); }
+                    ddelta_vals[i] += ddelta_from_v + ddelta_from_exp;
+                    
+                    // ∂L/∂A = dx · δ · (h_t - v_t)
+                    dA_val += delta_vals[i] * dx * h_t_minus_v_t_conj;
+                    
+                    if constexpr (kIsVariableB) {
+                        dB_vals[i] = conj(dv * params.alpha * delta_vals[i] * float(u_vals[i]));
+                    }
                     if constexpr (kIsVariableC) {
-                        dC_vals[i] = (2 * dout_vals[i]) * conj(!kIsVariableB ? x * B_val : x);
+                        dC_vals[i] = (2 * dout_vals[i]) * conj(!kIsVariableB ? h_t * B_val : h_t);
                     }
                 }
                 // Block-exchange to make the atomicAdd's coalesced, otherwise they're much slower

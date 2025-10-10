@@ -135,6 +135,13 @@ __device__ __forceinline__ complex_t cexpf(complex_t z) {
     return complex_t(c * t, s * t);
 }
 
+// SSM Scan Operator: Implements the associative operator for parallel prefix scan
+// (a1, b1) ⊕ (a0, b0) = (a1*a0, a1*b0 + b1)
+// This computes the first-order linear recurrence: x_t = a_t * x_{t-1} + b_t
+// 
+// For momentum SSM, this operator is used twice:
+// 1. Velocity scan: v_t = β * v_{t-1} + α*B*u  (where a=β, b=α*B*u)
+// 2. Hidden state scan: h_t = A * h_{t-1} + v  (where a=A, b=v)
 template<typename scalar_t> struct SSMScanOp;
 
 template<>

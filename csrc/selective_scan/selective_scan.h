@@ -33,6 +33,10 @@ struct SSMParamsBase {
 
     bool delta_softplus;
 
+    // Momentum parameters
+    float beta;  // momentum decay
+    float alpha;  // momentum scale
+
     index_t A_d_stride;
     index_t A_dstate_stride;
     index_t B_batch_stride;

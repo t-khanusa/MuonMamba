@@ -34,6 +34,35 @@ Where:
 - `β` ∈ [0, 1): momentum decay parameter (scalar hyperparameter)
 - `α` ∈ ℝ⁺: momentum scale parameter (scalar hyperparameter)
 
+### Discretization Note (Important!)
+
+The discretization shown above uses a **simplified first-order approximation** for the B term:
+
+```
+Ā_t = exp(δ_t · A)           [Exact discretization]
+B̄_t ≈ δ_t · B_t              [First-order approximation]
+```
+
+The **full Zero-Order Hold (ZOH)** discretization formula would be:
+```
+B̄_t = (δ_t·A)^(-1) · (exp(δ_t·A) - I) · (δ_t·B_t)
+```
+
+However, **this implementation follows the original Mamba architecture** which uses the simplified `δ_t · B_t` approximation for computational efficiency. This approximation is valid when δ_t is small (which is typically enforced through initialization and softplus activation).
+
+**Why the simplified form?**
+1. **Computational efficiency**: Avoids expensive matrix inversions
+2. **Numerical stability**: No division by potentially small eigenvalues
+3. **Consistency**: Matches Tri Dao's original Mamba implementation
+4. **Empirical performance**: Works well in practice when δ is properly regularized
+
+**Reference:** See the original Mamba paper (Gu & Dao, 2024) and the implementation in `mamba_simple.py` line 251:
+```python
+dB = torch.einsum("bd,bn->bdn", dt, B)  # Simplified: just δ·B
+```
+
+For theoretical analysis or comparison with classical SSMs, keep in mind that the full ZOH formula differs by a factor of approximately `(exp(δ·A) - I)/(δ·A)`.
+
 ### Hyperparameters
 
 - **`β` (beta)**: Momentum decay factor

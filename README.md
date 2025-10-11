@@ -98,7 +98,7 @@ Where `∂L/∂v_t` propagates backward via the velocity recurrence:
 ### Prerequisites
 
 - Python = 3.10.18
-- PyTorch = 2.7.1
+- PyTorch = 2.7.1+cu11.8
 - CUDA = 11.8
 
 ### Build from Source

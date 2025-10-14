@@ -103,7 +103,8 @@ Where `∂L/∂v_t` propagates backward via the velocity recurrence:
 
 ### Build from Source
 # Build and install
-pip install -e .
+cd ./mamba
+pip install -e . --no-build-isolation
 ```
 
 The build process compiles optimized CUDA kernels. Compilation may take 2-5 minutes.

@@ -596,18 +596,7 @@ Momentum Mamba: Gradient norm: 813.368 ± 164.297, Non-finite: 0/100
 
 ## Citation
 
-If you use Momentum Mamba in your research, please cite:
-
-```bibtex
-@software{momentum_mamba2025,
-  title={Momentum Mamba: Enhanced State Space Models with Momentum},
-  author={Your Name},
-  year={2025},
-  url={https://github.com/your-org/mamba}
-}
-```
-
-Also cite the original Mamba paper:
+If you use Momentum Mamba in your research, please cite the original Mamba paper:
 
 ```bibtex
 @inproceedings{gu2023mamba,

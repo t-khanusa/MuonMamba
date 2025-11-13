@@ -20,6 +20,7 @@
 #include "selective_scan.h"
 #include "selective_scan_common.h"
 #include "static_switch.h"
+#include "newton_schulz_fwd_kernel.cuh"
 
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,
@@ -149,7 +150,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         u += kChunkSize;
         delta += kChunkSize;
     
-        float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
+        float delta_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
             #pragma unroll
@@ -159,7 +160,6 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 if (params.delta_softplus) {
                     delta_vals[r][i] = delta_vals[r][i] <= 20.f ? log1pf(expf(delta_vals[r][i])) : delta_vals[r][i];
                 }
-                delta_u_vals[r][i] = delta_vals[r][i] * u_val;
                 out_vals[r][i] = D_val[r] * u_val;
             }
         }
@@ -183,6 +183,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             // If both B and C vary, this is unused.
             weight_t BC_val[kNRows];
             weight_t B_vals[kNItems], C_vals[kNItems];
+            weight_t B_val[kNRows];  // For constant B case
             if constexpr (kIsVariableB) {
                 load_weight<Ktraits>(Bvar + state_idx * params.B_dstate_stride, B_vals,
                     smem_load_weight, (params.seqlen - chunk * kChunkSize) * (!kIsComplex ? 1 : 2));
@@ -207,7 +208,22 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             if constexpr (!kIsVariableB && !kIsVariableC) {
                 #pragma unroll
                 for (int r = 0; r < kNRows; ++r) {
-                    BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride] * C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
+                    B_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride];
+                    // For momentum mode (use_newton_schulz or beta != 1.0): B already applied in b_t computation
+                    // Store only C since output will be: y = C*h (where h already contains B factor)
+                    // For original Mamba mode (beta == 1.0 and no NS): B applied at output
+                    // Store B*C to defer B multiplication for efficiency
+                    if (params.use_newton_schulz || params.beta != 1.0f) {
+                        BC_val[r] = C[state_idx * params.C_dstate_stride + r * params.C_d_stride];  // Just C
+                    } else {
+                        BC_val[r] = B_val[r] * C[state_idx * params.C_dstate_stride + r * params.C_d_stride];  // B*C
+                    }
+                }
+            }
+            if constexpr (!kIsVariableB && kIsVariableC) {
+                #pragma unroll
+                for (int r = 0; r < kNRows; ++r) {
+                    B_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride];
                 }
             }
 
@@ -215,23 +231,79 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             for (int r = 0; r < kNRows; ++r) {
                 if (r > 0) { __syncthreads(); }  // Scan could be using the same smem
                 
-                // Stage 1: Velocity scan - v_t = beta * v_{t-1} + alpha * B_t * x_t
+                // Stage 1: Velocity scan - v_t = beta * v_{t-1} + b_t_ortho (if NS enabled)
                 scan_t velocity_data[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     if constexpr (!kIsComplex) {
-                        float B_delta_u = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
-                        velocity_data[i] = make_float2(params.beta, params.alpha * B_delta_u);
+                        float delta_B_u;
+                        
+                        // If using Newton-Schulz, load from X_4_buffer (orthogonalized b_t)
+                        if (params.use_newton_schulz) {
+                            // Load from X_4_buffer (orthogonalized b_t)
+                            // Buffer shape: [batch, dim, seqlen, dstate]
+                            float *velocity_ortho_buffer = reinterpret_cast<float *>(params.X_4_buffer_ptr);
+                            int d = dim_id * kNRows + r;  // Global dim index
+                            int t = chunk * kChunkSize + threadIdx.x * kNItems + i;  // Global time index
+                            
+                            // CRITICAL: Bounds check before accessing buffer
+                            if (t < params.seqlen && d < params.dim) {
+                                int global_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                               d * params.seqlen * params.dstate +
+                                               t * params.dstate +
+                                               state_idx;
+                                delta_B_u = velocity_ortho_buffer[global_idx];
+                            } else {
+                                delta_B_u = 0.0f;  // Out of bounds, use zero
+                            }
+                        } else{
+                            // Normal mode: compute b_t on-the-fly
+                            delta_B_u = !kIsVariableB ? 
+                                delta_vals[r][i] * B_val[r] * float(u_vals[r][i]) : 
+                                delta_vals[r][i] * B_vals[i] * float(u_vals[r][i]);
+                            delta_B_u = params.alpha * delta_B_u;
+                        }
+                        
+                        velocity_data[i] = make_float2(params.beta, delta_B_u);
                         if constexpr (!Ktraits::kIsEvenLen) {
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 velocity_data[i] = make_float2(1.f, 0.f);
                             }
                         }
                     } else {
-                        weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
+                        weight_t delta_B_u_val;
+                        
+                        // For complex, also handle NS if needed
+                        if (params.use_newton_schulz) {
+                            // Load from X_4_buffer for complex case
+                            // Buffer shape: [batch, dim, seqlen, dstate] - stores real part only for now
+                            float *velocity_ortho_buffer = reinterpret_cast<float *>(params.X_4_buffer_ptr);
+                            int d = dim_id * kNRows + r;  // Global dim index
+                            int t = chunk * kChunkSize + threadIdx.x * kNItems + i;  // Global time index
+                            
+                            // CRITICAL: Bounds check before accessing buffer
+                            if (t < params.seqlen && d < params.dim) {
+                                int global_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                               d * params.seqlen * params.dstate +
+                                               t * params.dstate +
+                                               state_idx;
+                                // For complex: use real part from buffer, imag part is 0 (will be fixed after backward pass)
+                                float real_val = velocity_ortho_buffer[global_idx];
+                                delta_B_u_val = complex_t(real_val, 0.0f);
+                            } else {
+                                delta_B_u_val = complex_t(0.0f, 0.0f);
+                            }
+                        } else {
+                            // Normal mode: compute on-the-fly
+                            delta_B_u_val = !kIsVariableB ? 
+                                delta_vals[r][i] * B_val[r] * float(u_vals[r][i]) : 
+                                delta_vals[r][i] * B_vals[i] * float(u_vals[r][i]);
+                            delta_B_u_val = params.alpha * delta_B_u_val;
+                        }
+                        
                         velocity_data[i] = make_float4(params.beta, 0.f, 
-                                                       params.alpha * B_delta_u_val.real_, 
-                                                       params.alpha * B_delta_u_val.imag_);
+                                                       delta_B_u_val.real_, 
+                                                       delta_B_u_val.imag_);
                         if constexpr (!Ktraits::kIsEvenLen) {
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 velocity_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
@@ -313,8 +385,10 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     const weight_t C_val = !kIsVariableC
-                        ? BC_val[r]
-                        : (!kIsVariableB ? BC_val[r] * C_vals[i] : C_vals[i]);
+                        ? BC_val[r]  // Either C (momentum) or B*C (original Mamba)
+                        : (!kIsVariableB ? 
+                            (params.use_newton_schulz || params.beta != 1.0f ? C_vals[i] : BC_val[r] * C_vals[i])  // B const, C var
+                            : C_vals[i]);  // B var, C var
                     if constexpr (!kIsComplex) {
                         out_vals[r][i] += thread_data[i].y * C_val;
                     } else {
@@ -402,6 +476,70 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
 
 template<typename input_t, typename weight_t>
 void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
+
+    // Handle Newton-Schulz 5-step processing (speed optimized)
+    if (params.use_newton_schulz) {
+        // Phase 1 (NEW): 5-step NS with on-the-fly b_t computation
+        // This computes b_t = alpha*delta*B*u internally and applies 5 NS iterations
+        // Final output (X_5) is stored in X_4_buffer (reused as working buffer)
+        // For backward: X_4 will be recomputed from X_5
+        
+        // Cast to correct types: input_t for u/delta, weight_t for B
+        input_t* u = reinterpret_cast<input_t*>(params.u_ptr);
+        input_t* delta = reinterpret_cast<input_t*>(params.delta_ptr);
+        weight_t* B = reinterpret_cast<weight_t*>(params.B_ptr);
+        float* velocity_ortho = reinterpret_cast<float*>(params.X_4_buffer_ptr);
+        float* X_4_buffer = velocity_ortho;  // Same buffer - contains final X_5
+        
+        launch_newton_schulz_velocity_5step<input_t, weight_t>(
+            u, delta, B,
+            velocity_ortho, X_4_buffer,
+            params.alpha,
+            params.batch, params.dim, params.seqlen, params.dstate,
+            0, params.seqlen,
+            params.u_batch_stride, params.u_d_stride,
+            params.delta_batch_stride, params.delta_d_stride,
+            params.B_batch_stride, params.B_group_stride,
+            params.B_d_stride, params.B_dstate_stride,
+            params.is_variable_B, params.n_groups,
+            stream
+        );
+        
+        // NOTE: No synchronization needed! Both kernels are on the same stream,
+        // so CUDA guarantees in-order execution and memory visibility.
+        // The scan kernel will automatically see NS kernel's writes.
+        
+        // Phase 2: Continue scan with orthogonalized b_t
+        // The scan kernel will read from X_4_buffer
+        
+        #ifndef USE_ROCM
+            if (params.seqlen <= 128) {           
+                selective_scan_fwd_launch<32, 4, input_t, weight_t>(params, stream);
+            } else if (params.seqlen <= 256) {
+                selective_scan_fwd_launch<32, 8, input_t, weight_t>(params, stream);
+            } else if (params.seqlen <= 512) {
+                selective_scan_fwd_launch<32, 16, input_t, weight_t>(params, stream);
+            } else if (params.seqlen <= 1024) {
+                selective_scan_fwd_launch<64, 16, input_t, weight_t>(params, stream);
+            } else {
+                selective_scan_fwd_launch<128, 16, input_t, weight_t>(params, stream);
+            }
+        #else
+            if (params.seqlen <= 256) {
+                selective_scan_fwd_launch<64, 4, input_t, weight_t>(params, stream);
+            } else if (params.seqlen <= 512) {
+                selective_scan_fwd_launch<64, 8, input_t, weight_t>(params, stream);
+            } else if (params.seqlen <= 1024) {
+                selective_scan_fwd_launch<64, 16, input_t, weight_t>(params, stream);
+            } else {
+                selective_scan_fwd_launch<128, 16, input_t, weight_t>(params, stream);
+            }
+        #endif
+        
+        return;
+    }
+    
+    // Normal mode (no Newton-Schulz)
 
     #ifndef USE_ROCM
         if (params.seqlen <= 128) {           

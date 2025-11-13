@@ -23,6 +23,7 @@
 #include "selective_scan_common.h"
 #include "reverse_scan.cuh"
 #include "static_switch.h"
+#include "newton_schulz_bwd_kernel.cuh"
 
 template<typename scalar_t> __device__ __forceinline__ scalar_t conj(scalar_t x);
 template<> __device__ __forceinline__ float conj<float>(float x) { return x; }
@@ -113,6 +114,7 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     scan_t *smem_running_postfix = reinterpret_cast<scan_t *>(smem_delta_a + 2 * MAX_DSTATE + kNThreads);
     weight_t *smem_da = reinterpret_cast<weight_t *>(smem_running_postfix + MAX_DSTATE);
     weight_t *smem_dbc = reinterpret_cast<weight_t *>(smem_da + MAX_DSTATE);
+    weight_t *smem_dc = reinterpret_cast<weight_t *>(smem_dbc + MAX_DSTATE);  // Separate C gradient accumulator
 
     const int batch_id = blockIdx.x;
     const int dim_id = blockIdx.y;
@@ -250,11 +252,37 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
             
             if constexpr (!kIsComplex) {
                 // Step 1: Reconstruct velocity scan to get v_t values
+                // CRITICAL: When NS is enabled, forward uses b_t_ortho from X_4_buffer
+                // We MUST use the same b_t_ortho to reconstruct v_t correctly
                 scan_t velocity_data[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
-                    float B_delta_u = !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : delta_vals[i] * float(u_vals[i]) * B_vals[i];
-                    velocity_data[i] = make_float2(params.beta, params.alpha * B_delta_u);
+                    float delta_B_u;
+                    
+                    if (params.use_newton_schulz) {
+                        // Load b_t_ortho from X_4_buffer (same as forward pass)
+                        float *velocity_ortho_buffer = reinterpret_cast<float *>(params.X_4_buffer_ptr);
+                        const int time_idx = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                        
+                        if (time_idx < params.seqlen && velocity_ortho_buffer != nullptr) {
+                            // Layout: [batch, dim, seqlen, dstate]
+                            int global_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                           dim_id * params.seqlen * params.dstate +
+                                           time_idx * params.dstate +
+                                           state_idx;
+                            delta_B_u = velocity_ortho_buffer[global_idx];
+                        } else {
+                            delta_B_u = 0.0f;
+                        }
+                        // For NS: b_t_ortho is already scaled by alpha in forward, so use directly
+                        velocity_data[i] = make_float2(params.beta, delta_B_u);
+                    } else {
+                        // Normal mode: compute b_t = alpha * delta * B * u
+                        delta_B_u = !kIsVariableB ? 
+                            delta_vals[i] * B_val * float(u_vals[i]) : 
+                            delta_vals[i] * B_vals[i] * float(u_vals[i]);
+                        velocity_data[i] = make_float2(params.beta, params.alpha * delta_B_u);
+                    }
                 }
                 // Load velocity running prefix from even indices
                 scan_t v_running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
@@ -285,10 +313,30 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     } else {
                         thread_reverse_data[i - 1].x = delta_a_exp;
                     }
-                    thread_reverse_data[i].y = dout_vals[i] *
-                        (!kIsVariableC
-                         ? (!kIsVariableB ? B_val * C_val : C_val)
-                         : (!kIsVariableB ? B_val * C_vals[i] : C_vals[i]));
+                    // Match forward pass logic: In momentum mode (NS or beta != 1.0), B already in velocity
+                    // So output gradient is dout * C, not dout * B*C
+                    // For original Mamba (beta == 1.0 and no NS), output is dout * B*C
+                    const int time_idx_for_dout = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                    // CRITICAL FIX: Only set valid timesteps to prevent incorrect accumulation in reverse scan
+                    // Invalid timesteps (time_idx_for_dout >= seqlen) should use identity element (0 gradient)
+                    if (time_idx_for_dout < params.seqlen) {
+                        thread_reverse_data[i].y = dout_vals[i] *
+                            (!kIsVariableC
+                             ? (!kIsVariableB ? 
+                                (params.use_newton_schulz || params.beta != 1.0f ? C_val : B_val * C_val) : C_val)
+                             : (!kIsVariableB ? 
+                                (params.use_newton_schulz || params.beta != 1.0f ? C_vals[i] : B_val * C_vals[i]) : C_vals[i]));
+                    } else {
+                        // Invalid timestep: use zero gradient (identity for addition, but we need identity for scan)
+                        // For SSMScanOp, identity element is (1, 0) - this preserves the value
+                        thread_reverse_data[i].y = 0.f;  // Zero gradient for invalid timesteps
+                    }
+                    
+                    // DEBUG: Print dout_vals and thread_reverse_data for first few timesteps
+                    if (params.use_newton_schulz && time_idx_for_dout < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                        printf("MAIN_BWD_DOUT: batch=%d dim=%d time=%d state=%d dout_vals[%d]=%.6f thread_reverse_data[%d].y=%.6f\n",
+                               batch_id, dim_id, time_idx_for_dout, state_idx, i, dout_vals[i], i, thread_reverse_data[i].y);
+                    }
                 }
                 __syncthreads();
                 thread_reverse_data[kNItems - 1].x = threadIdx.x == kNThreads - 1
@@ -307,17 +355,50 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 );
                 if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2] = postfix_op.running_prefix; }
                 
+                // DEBUG: Print thread_reverse_data after hidden state reverse scan
+                if (params.use_newton_schulz) {
+                    #pragma unroll
+                    for (int i = 0; i < kNItems; ++i) {
+                        const int time_idx_debug_hs = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                        if (time_idx_debug_hs < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                            printf("MAIN_BWD_HS_AFTER: batch=%d dim=%d time=%d state=%d thread_reverse_data[%d].y=%.6f\n",
+                                   batch_id, dim_id, time_idx_debug_hs, state_idx, i, thread_reverse_data[i].y);
+                        }
+                    }
+                }
+                
                 // Step 3: Reverse scan through velocity to get correct gradients
                 // Velocity equation: v_t = β·v_{t-1} + α·B·δ·u
                 // Gradient flows backward: dv_{t-1} = β·dv_t
                 scan_t dv_reverse_data[kNItems];
+                // CRITICAL FIX: Zero out invalid items to prevent incorrect beta multiplication in ThreadReverseReduce
+                // ThreadReverseReduce processes items from [kNItems-1] down to [0], accumulating with scan_op
+                // Invalid items (with zero gradients) still multiply beta, causing incorrect accumulation
+                // Solution: Set invalid items to identity element (1, 0) which preserves value under scan_op
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
+                    const int time_idx_check = chunk * kChunkSize + threadIdx.x + i * kNThreads;
                     const float dx = thread_reverse_data[i].y;  // ∂L/∂h_t = ∂L/∂v_t (since h_t = ... + v_t)
-                    dv_reverse_data[i] = make_float2(params.beta, dx);  // (β, gradient)
+                    // Only process valid timesteps; use identity element (1, 0) for invalid timesteps
+                    // Identity element: scan_op((1, 0), (beta, g)) = (beta*1, beta*0 + g) = (beta, g) (preserves value)
+                    if (time_idx_check < params.seqlen) {
+                        dv_reverse_data[i] = make_float2(params.beta, dx);  // (β, gradient)
+                    } else {
+                        dv_reverse_data[i] = make_float2(1.f, 0.f);  // Identity element for invalid timesteps
+                    }
+                    
+                    // DEBUG: Print dv_reverse_data before reverse scan
+                    const int time_idx_debug = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                    if (params.use_newton_schulz && time_idx_debug < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                        printf("MAIN_BWD_DV_BEFORE: batch=%d dim=%d time=%d state=%d dv_reverse_data[%d].y=%.6f (dx=%.6f)\n",
+                               batch_id, dim_id, time_idx_debug, state_idx, i, dv_reverse_data[i].y, dx);
+                    }
                 }
                 
                 // Reverse scan for velocity gradients (interleave with hidden state in smem)
+                // CRITICAL: The postfix callback accumulates gradients from future chunks
+                // For chunk 0 (last chunk in reverse order), postfix should be identity (1, 0)
+                // For other chunks, load postfix from next chunk in reverse order (chunk+1)
                 scan_t dv_running_postfix = chunk < params.n_chunks - 1 && threadIdx.x % 32 == 0 ? 
                     smem_running_postfix[state_idx * 2 + 1] : make_float2(1.f, 0.f);
                 SSMScanPrefixCallbackOp<weight_t> dv_postfix_op(dv_running_postfix);
@@ -325,43 +406,144 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 typename Ktraits::BlockReverseScanT(smem_reverse_scan).InclusiveReverseScan(
                     dv_reverse_data, dv_reverse_data, SSMScanOp<weight_t>(), dv_postfix_op
                 );
+                
+                // DEBUG: Print dv_reverse_data after reverse scan
+                if (params.use_newton_schulz) {
+                    #pragma unroll
+                    for (int i = 0; i < kNItems; ++i) {
+                        const int time_idx_debug = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                        if (time_idx_debug < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                            printf("MAIN_BWD_DV_AFTER: batch=%d dim=%d time=%d state=%d dv_reverse_data[%d].y=%.6f\n",
+                                   batch_id, dim_id, time_idx_debug, state_idx, i, dv_reverse_data[i].y);
+                        }
+                    }
+                }
+                
                 // Save velocity gradient postfix for next chunk (interleave: state_idx*2+1)
-                if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2 + 1] = dv_postfix_op.running_prefix; }
+                // This postfix will be used by chunk-1 (next in reverse order)
+                if (threadIdx.x == 0) { 
+                    smem_running_postfix[state_idx * 2 + 1] = dv_postfix_op.running_prefix; 
+                }
                 
                 // Step 4: Compute gradients using correct v_t and dv values
-                weight_t dA_val = 0, dBC_val = 0;
+                weight_t dA_val = 0, dBC_val = 0, dC_val = 0;  // Separate dC_val for C-only gradients
                 weight_t dB_vals[kNItems], dC_vals[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     const float dx = thread_reverse_data[i].y;  // ∂L/∂h_t
-                    const float dv = dv_reverse_data[i].y;  // ∂L/∂(α·B·δ·u) after velocity reverse scan
+                    const float dv = dv_reverse_data[i].y;  // ∂L/∂(α·δ·B·u) after velocity reverse scan
                     const float h_t = thread_data[i].y;  // h_t (output of hidden state scan)
                     const float v_t = v_t_vals[i];  // Output of velocity scan
                     
                     // KEY: exp(δ·A)·h_{t-1} = h_t - v_t (from forward pass)
                     const float h_t_minus_v_t = h_t - v_t;  // exp(δ·A)·h_{t-1}
                     
-                    // Gradients (using correct chain rule with velocity reverse scan)
-                    // ∂L/∂(B·δ·u) = dv · α
-                    const float ddelta_u = !kIsVariableB ? (dv * params.alpha) : (dv * params.alpha * B_vals[i]);
-                    const float ddelta_from_v = ddelta_u * float(u_vals[i]);  // Through velocity path
-                    const float ddelta_from_exp = dx * A_val * h_t_minus_v_t;  // Through exp term
+                    // CRITICAL: When NS is enabled, dv is gradient w.r.t. b_t_ortho, not b_t directly
+                    // We must accumulate dv into grad_X_4_buffer and let NS backward compute gradients w.r.t. u, delta, B
+                    if (params.use_newton_schulz) {
+                        // Accumulate gradient w.r.t. b_t_ortho into grad_X_4_buffer
+                        const int time_idx = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                        // CRITICAL: Only process valid timesteps
+                        if (time_idx < params.seqlen) {
+                            float *grad_X_4_buffer = reinterpret_cast<float*>(params.grad_X_4_buffer_ptr);
+                            if (grad_X_4_buffer != nullptr) {
+                                // Layout: [batch, dim, seqlen, dstate]
+                                int grad_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                              dim_id * params.seqlen * params.dstate +
+                                              time_idx * params.dstate +
+                                              state_idx;
+                                
+                                // CRITICAL FIX: Ensure we're using the correct dv value
+                                // dv_reverse_data[i].y after reverse scan contains accumulated gradient
+                                // For timesteps 0-3, all use i=0, so dv_reverse_data[0].y is the correct value
+                                const float dv_to_accumulate = dv;
+                                
+                                // DEBUG: Print dv values and accumulation
+                                if (time_idx < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                                    printf("MAIN_BWD: batch=%d dim=%d time=%d state=%d dv=%.6f grad_idx=%d\n", 
+                                           batch_id, dim_id, time_idx, state_idx, dv_to_accumulate, grad_idx);
+                                }
+                                
+                                // dv is gradient w.r.t. b_t_ortho[batch, dim, time_idx, state_idx]
+                                // CRITICAL: Use atomicAdd to safely accumulate gradients
+                                gpuAtomicAdd(&grad_X_4_buffer[grad_idx], dv_to_accumulate);
+                                
+                                // DEBUG: Print after accumulation
+                                if (time_idx < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                                    // Read back to verify (atomic operations, so need sync)
+                                    __threadfence();
+                                    printf("MAIN_BWD: Accumulated grad_X_4[%d]=%.6f\n", grad_idx, grad_X_4_buffer[grad_idx]);
+                                }
+                            }
+                        }
+                        // Only compute gradients from exp path (not velocity path - that's handled by NS backward)
+                        const float ddelta_from_exp = dx * A_val * h_t_minus_v_t;
+                        ddelta_vals[i] += ddelta_from_exp;
+                    } else {
+                        // Normal mode: compute gradients directly
+                        // v_t = β·v_{t-1} + α·δ·B·u
+                        // dv = ∂L/∂(α·δ·B·u) from velocity reverse scan
+                        // ∂(α·δ·B·u)/∂δ = α·B·u
+                        // So: ∂L/∂δ (through velocity) = dv · α·B·u
+                        const float ddelta_from_v = !kIsVariableB ? 
+                            (dv * params.alpha * B_val * float(u_vals[i])) : 
+                            (dv * params.alpha * B_vals[i] * float(u_vals[i]));
+                        // ∂(exp(δ·A))/∂δ = A·exp(δ·A)·h_{t-1}
+                        // So: ∂L/∂δ (through exp) = dx · A · exp(δ·A)·h_{t-1} = dx · A · (h_t - v_t)
+                        const float ddelta_from_exp = dx * A_val * h_t_minus_v_t;
+                        
+                        // Update gradients
+                        // ∂L/∂u (through velocity) = dv · α·δ·B
+                        const float du_val = !kIsVariableB ? 
+                            (dv * params.alpha * delta_vals[i] * B_val) : 
+                            (dv * params.alpha * delta_vals[i] * B_vals[i]);
+                        du_vals[i] += du_val;
+                        ddelta_vals[i] += ddelta_from_v + ddelta_from_exp;
+                    }
                     
-                    du_vals[i] += ddelta_u * delta_vals[i];
-                    ddelta_vals[i] += ddelta_from_v + ddelta_from_exp;
-                    
-                    // ∂L/∂A = dx · δ · (h_t - v_t)
+                    // ∂L/∂A: h_t = exp(δ·A)·h_{t-1} + v_t
+                    // ∂h_t/∂A = δ·exp(δ·A)·h_{t-1} = δ·(h_t - v_t)
                     dA_val += dx * delta_vals[i] * h_t_minus_v_t;
                     
+                    // Accumulate B and C gradients
+                    // dx = ∂L/∂h_t = dout * C (momentum) or dout * B*C (original) - already computed at line 295
                     if constexpr (!kIsVariableB || !kIsVariableC) {
-                        if constexpr (!kIsVariableB) {  // dBC_val is dB_val
-                            dBC_val += dout_vals[i] * (!kIsVariableC ? h_t : h_t * C_vals[i]);
-                        } else {  // dBC_val is dC_val
+                        if constexpr (!kIsVariableB) {  // B is constant
+                            // For B gradient through output: dx * h_t (since dx already contains dout*C or dout*B*C)
+                            // But we also need velocity gradients, which are handled separately for NS
+                            if constexpr (!kIsVariableC) {  // Both constant
+                                // When NS is enabled, B gradients go to grad_X_4_buffer (handled below)
+                                // So we only accumulate here for non-NS case
+                                if (!params.use_newton_schulz) {
+                                    dBC_val += dx * h_t;  // dB through output: dx = dout*B*C (original mode)
+                                }
+                                // C gradient: always dout * h_t (independent of momentum mode) - accumulate separately
+                                dC_val += dout_vals[i] * h_t;
+                            } else {  // B constant, C variable
+                                // dB through output: dx * h_t (dx = dout*C_vals[i] in momentum mode)
+                                if (!params.use_newton_schulz) {
+                                    dBC_val += dx * h_t;
+                                }
+                            }
+                        } else {  // C is constant, B variable
+                            // dC gradient: always dout * h_t
                             dBC_val += dout_vals[i] * h_t;
                         }
                     }
                     if constexpr (kIsVariableB) {
-                        dB_vals[i] = dv * params.alpha * delta_vals[i] * float(u_vals[i]);
+                        if (params.use_newton_schulz) {
+                            // For variable B with NS, accumulate dv (gradient w.r.t. b_t_ortho) into grad_X_4_buffer
+                            // NS backward will compute gradients w.r.t. B
+                            // Note: We still need dB_vals for output path gradient (handled below in accumulation)
+                            dB_vals[i] = 0.0f;  // Don't use direct gradient - NS backward will compute
+                        } else {
+                            dB_vals[i] = dv * params.alpha * delta_vals[i] * float(u_vals[i]);
+                        }
+                    } else {
+                        // For constant B with NS, velocity path gradients are already accumulated above (dv -> grad_X_4_buffer)
+                        // In momentum mode: output path gradient for B is zero (B doesn't appear in y = C*h_t)
+                        // All B gradients come through velocity path only, which is already handled above
+                        // No additional accumulation needed here
                     }
                     if constexpr (kIsVariableC) {
                         dC_vals[i] = dout_vals[i] * (!kIsVariableB ? h_t * B_val : h_t);
@@ -379,20 +561,68 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     const int seqlen_remaining = params.seqlen - chunk * kChunkSize - threadIdx.x;
                     weight_t *dB_cur = dB + state_idx * params.dB_dstate_stride + chunk * kChunkSize + threadIdx.x;
                     weight_t *dC_cur = dC + state_idx * params.dC_dstate_stride + chunk * kChunkSize + threadIdx.x;
+                    
+                    // If Newton-Schulz is enabled, accumulate gradients w.r.t. orthogonalized B into grad_X_4_buffer
+                    // Otherwise, accumulate directly into dB
+                    float *grad_X_4_buffer = params.use_newton_schulz ? 
+                        reinterpret_cast<float*>(params.grad_X_4_buffer_ptr) : nullptr;
+                    
                     #pragma unroll
                     for (int i = 0; i < kNItems; ++i) {
                         if (i * kNThreads < seqlen_remaining) {
-                            if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals[i]); }
+                            if constexpr (kIsVariableB) {
+                                const int time_idx = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                                if (params.use_newton_schulz && grad_X_4_buffer != nullptr) {
+                                    // Accumulate gradient w.r.t. orthogonalized B into grad_X_4_buffer
+                                    // Layout: [batch, dim, seqlen, dstate]
+                                    int grad_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                                  dim_id * params.seqlen * params.dstate +
+                                                  time_idx * params.dstate +
+                                                  state_idx;
+                                    gpuAtomicAdd(&grad_X_4_buffer[grad_idx], float(dB_vals[i]));
+                                } else {
+                                    // Normal case: accumulate directly to dB
+                                    gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals[i]);
+                                }
+                            }
                             if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals[i]); }
                         }
                     }
                 }
                 if constexpr (!kIsVariableB || !kIsVariableC) {
-                    float2 dA_dBC_val = make_float2(dA_val, dBC_val);
-                    dA_dBC_val = typename Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
-                    dA_val = dA_dBC_val.x;
-                    if (threadIdx.x == 0) {
-                        smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dA_dBC_val.y : dA_dBC_val.y + smem_dbc[state_idx];
+                    if constexpr (!kIsVariableB && !kIsVariableC) {
+                        // Both constant: need separate reductions for B and C
+                        // Do separate reductions since BlockReduce doesn't support float4 directly
+                        float2 dA_dBC_val = make_float2(dA_val, dBC_val);
+                        dA_dBC_val = typename Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
+                        dA_val = dA_dBC_val.x;
+                        dC_val = typename Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dC_val);
+                        if (threadIdx.x == 0) {
+                            if (!params.use_newton_schulz) {
+                                // Normal case: accumulate B gradient across all timesteps
+                                smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dA_dBC_val.y : dA_dBC_val.y + smem_dbc[state_idx];
+                            }
+                            // C gradient: accumulate separately
+                            smem_dc[state_idx] = chunk == params.n_chunks - 1 ? dC_val : dC_val + smem_dc[state_idx];
+                        }
+                    } else {
+                        float2 dA_dBC_val = make_float2(dA_val, dBC_val);
+                        dA_dBC_val = typename Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
+                        dA_val = dA_dBC_val.x;
+                        if (threadIdx.x == 0) {
+                            // When NS is enabled and B is constant, B gradients are handled per-timestep
+                            // So skip accumulating dBC_val for B in that case
+                            if constexpr (!kIsVariableB) {
+                                if (!params.use_newton_schulz) {
+                                    // Normal case: accumulate B gradient across all timesteps
+                                    smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dA_dBC_val.y : dA_dBC_val.y + smem_dbc[state_idx];
+                                }
+                                // When NS is enabled, B gradients are accumulated per-timestep above, skip here
+                            } else {
+                                // C is constant (and B is variable), accumulate C gradient normally
+                                smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dA_dBC_val.y : dA_dBC_val.y + smem_dbc[state_idx];
+                            }
+                        }
                     }
                 } else {
                     dA_val = typename Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dA_val);
@@ -402,13 +632,41 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 }
             } else {
                 // Step 1: Reconstruct velocity scan to get v_t values (complex case)
+                // CRITICAL: When NS is enabled, forward uses b_t_ortho from X_4_buffer
+                // We MUST use the same b_t_ortho to reconstruct v_t correctly
                 scan_t velocity_data[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
-                    weight_t B_delta_u_val = !kIsVariableB ? delta_vals[i] * float(u_vals[i]) : B_vals[i] * delta_vals[i] * float(u_vals[i]);
-                    velocity_data[i] = make_float4(params.beta, 0.f, 
-                                                   params.alpha * B_delta_u_val.real_, 
-                                                   params.alpha * B_delta_u_val.imag_);
+                    weight_t delta_B_u_val;
+                    
+                    if (params.use_newton_schulz) {
+                        // Load b_t_ortho from X_4_buffer for complex case
+                        float *velocity_ortho_buffer = reinterpret_cast<float *>(params.X_4_buffer_ptr);
+                        const int time_idx = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                        
+                        if (time_idx < params.seqlen && velocity_ortho_buffer != nullptr) {
+                            // Layout: [batch, dim, seqlen, dstate] (stored as real float values from NS)
+                            int global_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                           dim_id * params.seqlen * params.dstate +
+                                           time_idx * params.dstate +
+                                           state_idx;
+                            // NS output is real-valued, but we need complex for the scan
+                            // For complex A case, NS is applied to real representation
+                            delta_B_u_val = complex_t(velocity_ortho_buffer[global_idx], 0.0f);
+                        } else {
+                            delta_B_u_val = complex_t(0.0f, 0.0f);
+                        }
+                        // For NS: b_t_ortho is already scaled by alpha in forward
+                        velocity_data[i] = make_float4(params.beta, 0.f, delta_B_u_val.real_, delta_B_u_val.imag_);
+                    } else {
+                        // Normal mode: compute b_t = alpha * delta * B * u
+                        delta_B_u_val = !kIsVariableB ? 
+                            delta_vals[i] * B_val * float(u_vals[i]) : 
+                            delta_vals[i] * B_vals[i] * float(u_vals[i]);
+                        velocity_data[i] = make_float4(params.beta, 0.f, 
+                                                       params.alpha * delta_B_u_val.real_, 
+                                                       params.alpha * delta_B_u_val.imag_);
+                    }
                 }
                 // Load velocity running prefix from even indices
                 scan_t v_running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? 
@@ -441,10 +699,14 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                         thread_reverse_data[i - 1].x = delta_a_exp.real_;
                         thread_reverse_data[i - 1].y = -delta_a_exp.imag_;
                     }
+                    // Match forward pass logic: In momentum mode (NS or beta != 1.0), B already in velocity
+                    // So output gradient is dout * C, not dout * B*C
                     complex_t dout_BC = 2 * dout_vals[i]
                         * conj(!kIsVariableC
-                                ? (!kIsVariableB ? B_val * C_val : C_val)
-                                : (!kIsVariableB ? B_val * C_vals[i] : C_vals[i]));
+                                ? (!kIsVariableB ? 
+                                   (params.use_newton_schulz || params.beta != 1.0f ? C_val : B_val * C_val) : C_val)
+                                : (!kIsVariableB ? 
+                                   (params.use_newton_schulz || params.beta != 1.0f ? C_vals[i] : B_val * C_vals[i]) : C_vals[i]));
                     thread_reverse_data[i].z = dout_BC.real_;
                     thread_reverse_data[i].w = dout_BC.imag_;
                 }
@@ -489,7 +751,7 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                 if (threadIdx.x == 0) { smem_running_postfix[state_idx * 2 + 1] = dv_postfix_op.running_prefix; }
                 
                 // Step 4: Compute gradients using correct v_t and dv values
-                weight_t dA_val = 0, dBC_val = 0;
+                weight_t dA_val = 0, dBC_val = 0, dC_val = 0;  // Separate dC_val for C-only gradients
                 weight_t dB_vals[kNItems], dC_vals[kNItems];
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
@@ -502,28 +764,105 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     complex_t h_t_minus_v_t = h_t - v_t;  // exp(δ·A)·h_{t-1}
                     complex_t h_t_minus_v_t_conj = conj(h_t_minus_v_t);
                     
-                    // Gradients (using correct chain rule with velocity reverse scan)
-                    // ∂L/∂(B·δ·u) = dv · α
-                    float ddelta_u = !kIsVariableB ? (dv.real_ * params.alpha) : ((dv * conj(B_vals[i])).real_ * params.alpha);
-                    float ddelta_from_v = ddelta_u * float(u_vals[i]);  // Through velocity path
-                    float ddelta_from_exp = (dx * conj(A_val) * h_t_minus_v_t_conj).real_;  // Through exp term
+                    // CRITICAL: When NS is enabled, dv is gradient w.r.t. b_t_ortho, not b_t directly
+                    // We must accumulate dv into grad_X_4_buffer and let NS backward compute gradients w.r.t. u, delta, B
+                    if (params.use_newton_schulz) {
+                        // Accumulate gradient w.r.t. b_t_ortho into grad_X_4_buffer
+                        const int time_idx = chunk * kChunkSize + threadIdx.x + i * kNThreads;
+                        // CRITICAL: Only process valid timesteps
+                        if (time_idx < params.seqlen) {
+                            float *grad_X_4_buffer = reinterpret_cast<float*>(params.grad_X_4_buffer_ptr);
+                            if (grad_X_4_buffer != nullptr) {
+                                // Layout: [batch, dim, seqlen, dstate]
+                                // For complex, NS is applied to real representation, so store real part only
+                                int grad_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                              dim_id * params.seqlen * params.dstate +
+                                              time_idx * params.dstate +
+                                              state_idx;
+                                
+                                // DEBUG: Print dv values and accumulation (complex case)
+                                if (time_idx < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                                    printf("MAIN_BWD_COMPLEX: batch=%d dim=%d time=%d state=%d dv.real=%.6f grad_idx=%d\n", 
+                                           batch_id, dim_id, time_idx, state_idx, dv.real_, grad_idx);
+                                }
+                                
+                                // dv is complex gradient w.r.t. b_t_ortho, but NS input/output is real, so use real part
+                                // Actually, for complex case, NS converts to real representation first
+                                // So we need to accumulate the real part of dv
+                                gpuAtomicAdd(&grad_X_4_buffer[grad_idx], dv.real_);
+                                
+                                // DEBUG: Print after accumulation (complex case)
+                                if (time_idx < 4 && batch_id == 0 && dim_id == 0 && state_idx == 0) {
+                                    printf("MAIN_BWD_COMPLEX: Accumulated grad_X_4[%d]=%.6f\n", grad_idx, grad_X_4_buffer[grad_idx]);
+                                }
+                            }
+                        }
+                        // Only compute gradients from exp path (not velocity path - that's handled by NS backward)
+                        float ddelta_from_exp = (dx * conj(A_val) * h_t_minus_v_t_conj).real_;
+                        ddelta_vals[i] += ddelta_from_exp;
+                    } else {
+                        // Normal mode: compute gradients directly
+                        // v_t = β·v_{t-1} + α·δ·B·u
+                        // dv = ∂L/∂(α·δ·B·u) from velocity reverse scan
+                        // For complex: ∂L/∂δ (through velocity) = (dv · α·B·u).real_
+                        float ddelta_from_v = !kIsVariableB ?
+                            ((dv * params.alpha * B_val * float(u_vals[i])).real_) :
+                            ((dv * params.alpha * B_vals[i] * float(u_vals[i])).real_);
+                        // ∂(exp(δ·A))/∂δ = A·exp(δ·A)·h_{t-1}
+                        // For complex: ∂L/∂δ (through exp) = (dx · conj(A) · conj(exp(δ·A)·h_{t-1})).real_
+                        float ddelta_from_exp = (dx * conj(A_val) * h_t_minus_v_t_conj).real_;
+                        
+                        // Update u gradient: ∂L/∂u (through velocity) = dv · α·δ·B
+                        float du_val = !kIsVariableB ?
+                            ((dv * params.alpha * delta_vals[i] * B_val).real_) :
+                            ((dv * params.alpha * delta_vals[i] * B_vals[i]).real_);
+                        du_vals[i] += du_val;
+                        ddelta_vals[i] += ddelta_from_v + ddelta_from_exp;
+                    }
                     
+                    // Accumulate B and C gradients (complex case)
+                    // dx = ∂L/∂h_t = 2 * dout * conj(C) (momentum) or 2 * dout * conj(B*C) (original)
                     if constexpr (!kIsVariableB || !kIsVariableC) {
-                        if constexpr (!kIsVariableB) {  // dBC_val is dB_val
-                            dBC_val += (2 * dout_vals[i]) * conj(!kIsVariableC ? h_t : h_t * C_vals[i]);
-                        } else {  // dBC_val is dC_val
+                        if constexpr (!kIsVariableB) {  // B is constant
+                            if constexpr (!kIsVariableC) {  // Both constant
+                                // For B gradient through output: use dx (which already contains the correct factor)
+                                // dx = 2 * dout * conj(C) (momentum) or 2 * dout * conj(B*C) (original)
+                                if (!params.use_newton_schulz) {
+                                    dBC_val += dx * h_t;  // dB through output
+                                }
+                                // C gradient: always (2 * dout) * conj(h_t)
+                                dC_val += (2 * dout_vals[i]) * conj(h_t);
+                            } else {  // B constant, C variable
+                                // dB through output: dx * h_t
+                                if (!params.use_newton_schulz) {
+                                    dBC_val += dx * h_t;
+                                }
+                            }
+                        } else {  // C is constant, B variable
+                            // dC gradient: always (2 * dout) * conj(h_t)
                             dBC_val += (2 * dout_vals[i]) * conj(h_t);
                         }
                     }
                     
-                    du_vals[i] += ddelta_u * delta_vals[i];
-                    ddelta_vals[i] += ddelta_from_v + ddelta_from_exp;
-                    
-                    // ∂L/∂A = dx · δ · (h_t - v_t)
+                    // ∂L/∂A: h_t = exp(δ·A)·h_{t-1} + v_t
+                    // Direct contribution: ∂h_t/∂A = δ·exp(δ·A)·h_{t-1}
+                    // For complex A, we need conjugate
+                    // ∂L/∂A (from time t) = (∂L/∂h_t) · δ · exp(δ·A)·h_{t-1} = dx · δ · (h_t - v_t)
                     dA_val += delta_vals[i] * dx * h_t_minus_v_t_conj;
                     
                     if constexpr (kIsVariableB) {
-                        dB_vals[i] = conj(dv * params.alpha * delta_vals[i] * float(u_vals[i]));
+                        if (params.use_newton_schulz) {
+                            // For variable B with NS, accumulate dv (gradient w.r.t. b_t_ortho) into grad_X_4_buffer
+                            // NS backward will compute gradients w.r.t. B
+                            dB_vals[i] = complex_t(0.0f, 0.0f);  // Don't use direct gradient - NS backward will compute
+                        } else {
+                            dB_vals[i] = conj(dv * params.alpha * delta_vals[i] * float(u_vals[i]));
+                        }
+                    } else {
+                        // For constant B with NS (complex A case), velocity path gradients are already accumulated above (dv.real_ -> grad_X_4_buffer)
+                        // In momentum mode: output path gradient for B is zero (B doesn't appear in y = C*h_t)
+                        // All B gradients come through velocity path only, which is already handled above
+                        // No additional accumulation needed here
                     }
                     if constexpr (kIsVariableC) {
                         dC_vals[i] = (2 * dout_vals[i]) * conj(!kIsVariableB ? h_t * B_val : h_t);
@@ -552,21 +891,75 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
                     const int seqlen_remaining = (params.seqlen - chunk * kChunkSize) * 2 - threadIdx.x;
                     float *dB_cur = reinterpret_cast<float *>(dB) + state_idx * params.dB_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
                     float *dC_cur = reinterpret_cast<float *>(dC) + state_idx * params.dC_dstate_stride + chunk * kChunkSize * 2 + threadIdx.x;
+                    
+                    // If Newton-Schulz is enabled, accumulate gradients w.r.t. orthogonalized B into grad_X_4_buffer
+                    // Note: B is real (input_t), so we extract real part from complex gradient
+                    float *grad_X_4_buffer = params.use_newton_schulz && kIsVariableB ? 
+                        reinterpret_cast<float*>(params.grad_X_4_buffer_ptr) : nullptr;
+                    
                     #pragma unroll
                     for (int i = 0; i < kNItems * 2; ++i) {
                         if (i * kNThreads < seqlen_remaining) {
-                            if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals_f[i]); }
+                            if constexpr (kIsVariableB) {
+                                // For NS: B is real, so gradient w.r.t. B is real part only
+                                // dB_vals_f is interleaved: [real0, imag0, real1, imag1, ...]
+                                // For NS, we only accumulate real parts (even indices)
+                                if (grad_X_4_buffer != nullptr && (i % 2 == 0)) {
+                                    // Extract item index from complex interleaved index
+                                    const int item_idx = i / 2;
+                                    const int time_idx = chunk * kChunkSize + threadIdx.x + item_idx * kNThreads;
+                                    if (time_idx < params.seqlen) {
+                                        // Layout: [batch, dim, seqlen, dstate]
+                                        int grad_idx = batch_id * params.dim * params.seqlen * params.dstate +
+                                                      dim_id * params.seqlen * params.dstate +
+                                                      time_idx * params.dstate +
+                                                      state_idx;
+                                        // dB_vals_f[i] is the real part (i is even)
+                                        gpuAtomicAdd(&grad_X_4_buffer[grad_idx], dB_vals_f[i]);
+                                    }
+                                } else if (!params.use_newton_schulz) {
+                                    // Normal case: accumulate directly to dB (complex format)
+                                    gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals_f[i]);
+                                }
+                            }
                             if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals_f[i]); }
                         }
                     }
                 }
                 if constexpr (!kIsVariableB || !kIsVariableC) {
-                    float4 dA_dBC_val = make_float4(dA_val.real_, dA_val.imag_, dBC_val.real_, dBC_val.imag_);
-                    dA_dBC_val = typename Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
-                    dA_val = complex_t(dA_dBC_val.x, dA_dBC_val.y);
-                    dBC_val = complex_t(dA_dBC_val.z, dA_dBC_val.w);
-                    if (threadIdx.x == 0) {
-                        smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dBC_val : dBC_val + smem_dbc[state_idx];
+                    if constexpr (!kIsVariableB && !kIsVariableC) {
+                        // Both constant: need separate reductions for B and C (complex case)
+                        float4 dA_dBC_val = make_float4(dA_val.real_, dA_val.imag_, dBC_val.real_, dBC_val.imag_);
+                        dA_dBC_val = typename Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
+                        dA_val = complex_t(dA_dBC_val.x, dA_dBC_val.y);
+                        dBC_val = complex_t(dA_dBC_val.z, dA_dBC_val.w);
+                        dC_val = typename Ktraits::BlockReduceComplexT(smem_reduce_complex).Sum(dC_val);
+                        if (threadIdx.x == 0) {
+                            if (!params.use_newton_schulz) {
+                                // Normal case: accumulate B gradient across all timesteps
+                                smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dBC_val : dBC_val + smem_dbc[state_idx];
+                            }
+                            // C gradient: accumulate separately
+                            smem_dc[state_idx] = chunk == params.n_chunks - 1 ? dC_val : dC_val + smem_dc[state_idx];
+                        }
+                    } else {
+                        float4 dA_dBC_val = make_float4(dA_val.real_, dA_val.imag_, dBC_val.real_, dBC_val.imag_);
+                        dA_dBC_val = typename Ktraits::BlockReduceT(smem_reduce).Sum(dA_dBC_val);
+                        dA_val = complex_t(dA_dBC_val.x, dA_dBC_val.y);
+                        dBC_val = complex_t(dA_dBC_val.z, dA_dBC_val.w);
+                        if (threadIdx.x == 0) {
+                            // When NS is enabled and B is constant, B gradients are handled per-timestep
+                            if constexpr (!kIsVariableB) {
+                                if (!params.use_newton_schulz) {
+                                    // Normal case: accumulate B gradient across all timesteps
+                                    smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dBC_val : dBC_val + smem_dbc[state_idx];
+                                }
+                                // When NS is enabled, B gradients are accumulated per-timestep above, skip here
+                            } else {
+                                // C is constant (and B is variable), accumulate C gradient normally
+                                smem_dbc[state_idx] = chunk == params.n_chunks - 1 ? dBC_val : dBC_val + smem_dbc[state_idx];
+                            }
+                        }
                     }
                 } else {
                     dA_val = typename Ktraits::BlockReduceComplexT(smem_reduce_complex).Sum(dA_val);
@@ -616,15 +1009,31 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
     }
     for (int state_idx = threadIdx.x; state_idx < params.dstate; state_idx += blockDim.x) {
         gpuAtomicAdd(&(dA[state_idx * params.dA_dstate_stride]), smem_da[state_idx]);
-        weight_t dBC_val;
-        if (!kIsVariableB || !kIsVariableC) { dBC_val = smem_dbc[state_idx]; }
+        weight_t dBC_val = 0;
+        weight_t dC_val = 0;
+        if (!kIsVariableB || !kIsVariableC) { 
+            dBC_val = smem_dbc[state_idx];
+            if constexpr (!kIsVariableB && !kIsVariableC) {
+                // Both constant: use separate C gradient accumulator
+                dC_val = smem_dc[state_idx];
+            }
+        }
         if constexpr (!kIsVariableB) {
-            gpuAtomicAdd(&(dB[state_idx * params.dB_dstate_stride]),
-                         !kIsVariableC ? dBC_val * conj(C[state_idx * params.C_dstate_stride]) : dBC_val);
+            // When NS is enabled, B gradients are handled per-timestep by NS backward pass
+            // Skip direct accumulation here
+            if (!params.use_newton_schulz) {
+                // B gradient: dBC_val contains it directly (no need for conversion)
+                gpuAtomicAdd(&(dB[state_idx * params.dB_dstate_stride]), dBC_val);
+            }
         }
         if constexpr (!kIsVariableC) {
-            gpuAtomicAdd(&(dC[state_idx * params.dC_dstate_stride]),
-                        !kIsVariableB ? dBC_val * conj(B[state_idx * params.B_dstate_stride]) : dBC_val);
+            if constexpr (!kIsVariableB) {
+                // Both constant: use separate C gradient accumulator (fixes Issue 1 & 4)
+                gpuAtomicAdd(&(dC[state_idx * params.dC_dstate_stride]), dC_val);
+            } else {
+                // C constant, B variable: dBC_val is C gradient
+                gpuAtomicAdd(&(dC[state_idx * params.dC_dstate_stride]), dBC_val);
+            }
         }
     }
 }
@@ -639,7 +1048,7 @@ void selective_scan_bwd_launch(SSMParamsBwd &params, cudaStream_t stream) {
                         using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, kIsEvenLen, kIsVariableB, kIsVariableC, kDeltaSoftplus, kHasZ, input_t, weight_t>;
                         // using Ktraits = Selective_Scan_bwd_kernel_traits<kNThreads, kNItems, true, kIsVariableB, kIsVariableC, kDeltaSoftplus, kHasZ, input_t, weight_t>;
                         // TODO: check this
-                        constexpr int kSmemSize = Ktraits::kSmemSize + MAX_DSTATE * sizeof(typename Ktraits::scan_t) + (kNThreads + 4 * MAX_DSTATE) * sizeof(typename Ktraits::weight_t);
+                        constexpr int kSmemSize = Ktraits::kSmemSize + MAX_DSTATE * sizeof(typename Ktraits::scan_t) + (kNThreads + 5 * MAX_DSTATE) * sizeof(typename Ktraits::weight_t);  // +1 for smem_dc when both B and C are constant
 
                         dim3 grid(params.batch, params.dim);
                         
@@ -693,4 +1102,40 @@ void selective_scan_bwd_cuda(SSMParamsBwd &params, cudaStream_t stream) {
             selective_scan_bwd_launch<128, 16, input_t, weight_t>(params, stream);
         }
     #endif
+    
+    // If Newton-Schulz is enabled, call NS backward pass to compute gradients w.r.t. original inputs
+    if (params.use_newton_schulz && params.grad_X_4_buffer_ptr != nullptr) {
+        // Cast to correct types for NS backward
+        input_t* u_ptr = reinterpret_cast<input_t*>(params.u_ptr);
+        input_t* delta_ptr = reinterpret_cast<input_t*>(params.delta_ptr);
+        weight_t* B_ptr = reinterpret_cast<weight_t*>(params.B_ptr);
+        float* grad_X_4 = reinterpret_cast<float*>(params.grad_X_4_buffer_ptr);
+        
+        // Use temporary float32 buffers for NS backward output (these will be converted and added later)
+        float* grad_u_ptr = reinterpret_cast<float*>(params.du_ns_temp_ptr);
+        float* grad_delta_ptr = reinterpret_cast<float*>(params.ddelta_ns_temp_ptr);
+        float* grad_B_ptr = reinterpret_cast<float*>(params.dB_ns_temp_ptr);
+        
+        // Launch NS backward pass
+        // grad_X_4 contains gradients w.r.t. orthogonalized B (output of NS)
+        // NS backward will compute and ADD gradients to the temporary float32 buffers
+        float* X_temp = reinterpret_cast<float*>(params.X_temp_ptr);
+        float* dX_4_temp = reinterpret_cast<float*>(params.dX_4_temp_ptr);
+        launch_newton_schulz_velocity_5step_backward<input_t, weight_t>(
+            grad_X_4,  // grad_output: gradients w.r.t. NS output
+            u_ptr, delta_ptr, B_ptr,  // Original inputs for recomputation
+            grad_u_ptr, grad_delta_ptr, grad_B_ptr,  // Output gradients (temp float32 buffers)
+            X_temp, dX_4_temp,  // Pre-allocated temporary buffers for recomputation
+            params.alpha,
+            params.batch, params.dim, params.seqlen, params.dstate,
+            0, params.seqlen,  // Process all timesteps
+            params.u_batch_stride, params.u_d_stride,
+            params.delta_batch_stride, params.delta_d_stride,
+            params.B_batch_stride, params.B_group_stride,
+            params.B_d_stride, params.B_dstate_stride,
+            params.is_variable_B, params.n_groups,
+            stream
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }

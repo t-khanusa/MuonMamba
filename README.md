@@ -275,14 +275,15 @@ The forward kernel implements momentum through a **two-stage parallel prefix sum
 
 **Stage 1: Velocity Scan**
 ```cuda
-// Construct velocity recurrence: (β, α·B·δ·u)
+// Construct velocity recurrence: (β, α·(δ·B)·u)
 for (int i = 0; i < kNItems; ++i) {
-    float B_delta_u = delta_vals[i] * u_vals[i] * B_vals[i];
+    float delta_u = delta_vals[i] * u_vals[i];  // δ·u
+    float B_delta_u = B_vals[i] * delta_u;      // B·(δ·u) = B·δ·u
     velocity_data[i] = make_float2(params.beta, params.alpha * B_delta_u);
 }
 
 // Parallel scan using SSMScanOp: (a, b) ⊕ (a', b') = (a·a', a·b' + b)
-// This computes: v_t = β·v_{t-1} + α·B·δ·u
+// This computes: v_t = β·v_{t-1} + α·(δ·B)·u
 BlockScan(smem_scan).InclusiveScan(
     velocity_data, velocity_data, SSMScanOp(), v_prefix_op
 );

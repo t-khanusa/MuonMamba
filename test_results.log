@@ -1,0 +1,176 @@
+MAIN_BWD_DOUT: batch=0 dim=0 time=0 state=0 dout_vals[0]=-1.724382 thread_reverse_data[0].y=0.218690
+MAIN_BWD_DOUT: batch=0 dim=0 time=1 state=0 dout_vals[0]=0.177362 thread_reverse_data[0].y=-0.022493
+MAIN_BWD_DOUT: batch=0 dim=0 time=2 state=0 dout_vals[0]=0.000000 thread_reverse_data[0].y=-0.000000
+MAIN_BWD_DOUT: batch=0 dim=0 time=3 state=0 dout_vals[0]=0.000000 thread_reverse_data[0].y=-0.000000
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=0 state=0 thread_reverse_data[0].y=0.197405
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=1 state=0 thread_reverse_data[0].y=-0.022493
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=2 state=0 thread_reverse_data[0].y=0.000000
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=3 state=0 thread_reverse_data[0].y=0.000000
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=0 state=0 dv_reverse_data[0].y=0.197405 (dx=0.197405)
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=1 state=0 dv_reverse_data[0].y=-0.022493 (dx=-0.022493)
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=2 state=0 dv_reverse_data[0].y=0.000000 (dx=0.000000)
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=3 state=0 dv_reverse_data[0].y=0.000000 (dx=0.000000)
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=0 state=0 dv_reverse_data[0].y=0.186158
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=1 state=0 dv_reverse_data[0].y=-0.022493
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=2 state=0 dv_reverse_data[0].y=0.000000
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=3 state=0 dv_reverse_data[0].y=0.000000
+MAIN_BWD: batch=0 dim=0 time=0 state=0 dv=0.186158 grad_idx=0
+MAIN_BWD: batch=0 dim=0 time=1 state=0 dv=-0.022493 grad_idx=4
+MAIN_BWD: batch=0 dim=0 time=2 state=0 dv=0.000000 grad_idx=8
+MAIN_BWD: batch=0 dim=0 time=3 state=0 dv=0.000000 grad_idx=12
+MAIN_BWD: Accumulated grad_X_4[0]=0.186158
+MAIN_BWD: Accumulated grad_X_4[4]=-0.022493
+MAIN_BWD: Accumulated grad_X_4[8]=0.000000
+MAIN_BWD: Accumulated grad_X_4[12]=0.000000
+NS_BWD: batch=0 time=0 dim=0 state=0 grad_output=0.186158 dX_4_temp=0.641223 buffer_idx=0
+NS_BWD: batch=0 time=2 dim=0 state=0 grad_output=0.000000 dX_4_temp=0.000000 buffer_idx=8
+NS_BWD: batch=0 time=1 dim=0 state=0 grad_output=-0.022493 dX_4_temp=-0.077479 buffer_idx=4
+NS_BWD: batch=0 time=3 dim=0 state=0 grad_output=0.000000 dX_4_temp=0.000000 buffer_idx=12
+NS_BWD: batch=0 time=0 dim=0 grad_u_before=0.000000 partial_sum=0.020808
+NS_BWD: batch=0 time=2 dim=0 grad_u_before=0.000000 partial_sum=0.000000
+NS_BWD: batch=0 time=1 dim=0 grad_u_before=0.000000 partial_sum=0.005588
+NS_BWD: batch=0 time=3 dim=0 grad_u_before=0.000000 partial_sum=0.000000
+NS_BWD: batch=0 time=1 dim=0 grad_u_after=0.005588
+NS_BWD: batch=0 time=0 dim=0 grad_u_after=0.020808
+NS_BWD: batch=0 time=3 dim=0 grad_u_after=0.000000
+NS_BWD: batch=0 time=2 dim=0 grad_u_after=0.000000
+NS_BWD: batch=0 time=1 dim=0 grad_delta_before=0.000000 partial_sum=-1.116067
+NS_BWD: batch=0 time=0 dim=0 grad_delta_before=0.000000 partial_sum=0.290152
+NS_BWD: batch=0 time=3 dim=0 grad_delta_before=0.000000 partial_sum=0.000000
+NS_BWD: batch=0 time=2 dim=0 grad_delta_before=0.000000 partial_sum=0.000000
+NS_BWD: batch=0 time=1 dim=0 grad_delta_after=-1.116067
+NS_BWD: batch=0 time=3 dim=0 grad_delta_after=0.000000
+NS_BWD: batch=0 time=0 dim=0 grad_delta_after=0.290152
+NS_BWD: batch=0 time=2 dim=0 grad_delta_after=0.000000
+MAIN_BWD_DOUT: batch=0 dim=0 time=0 state=0 dout_vals[0]=-1.724382 thread_reverse_data[0].y=0.218690
+MAIN_BWD_DOUT: batch=0 dim=0 time=1 state=0 dout_vals[0]=0.177362 thread_reverse_data[0].y=-0.022493
+MAIN_BWD_DOUT: batch=0 dim=0 time=2 state=0 dout_vals[0]=0.460777 thread_reverse_data[0].y=-0.058437
+MAIN_BWD_DOUT: batch=0 dim=0 time=3 state=0 dout_vals[0]=-0.167695 thread_reverse_data[0].y=0.021267
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=0 state=0 thread_reverse_data[0].y=0.169059
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=1 state=0 thread_reverse_data[0].y=-0.052449
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=2 state=0 thread_reverse_data[0].y=-0.027917
+MAIN_BWD_HS_AFTER: batch=0 dim=0 time=3 state=0 thread_reverse_data[0].y=0.021267
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=0 state=0 dv_reverse_data[0].y=0.169059 (dx=0.169059)
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=1 state=0 dv_reverse_data[0].y=-0.052449 (dx=-0.052449)
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=2 state=0 dv_reverse_data[0].y=-0.027917 (dx=-0.027917)
+MAIN_BWD_DV_BEFORE: batch=0 dim=0 time=3 state=0 dv_reverse_data[0].y=0.021267 (dx=0.021267)
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=0 state=0 dv_reverse_data[0].y=0.114746
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=1 state=0 dv_reverse_data[0].y=-0.060348
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=2 state=0 dv_reverse_data[0].y=-0.008776
+MAIN_BWD_DV_AFTER: batch=0 dim=0 time=3 state=0 dv_reverse_data[0].y=0.021267
+MAIN_BWD: batch=0 dim=0 time=0 state=0 dv=0.114746 grad_idx=0
+MAIN_BWD: batch=0 dim=0 time=1 state=0 dv=-0.060348 grad_idx=4
+MAIN_BWD: batch=0 dim=0 time=2 state=0 dv=-0.008776 grad_idx=8
+MAIN_BWD: batch=0 dim=0 time=3 state=0 dv=0.021267 grad_idx=12
+MAIN_BWD: Accumulated grad_X_4[0]=0.114746
+MAIN_BWD: Accumulated grad_X_4[4]=-0.060348
+MAIN_BWD: Accumulated grad_X_4[8]=-0.008776
+MAIN_BWD: Accumulated grad_X_4[12]=0.021267
+NS_BWD: batch=0 time=0 dim=0 state=0 grad_output=0.114746 dX_4_temp=0.395242 buffer_idx=0
+NS_BWD: batch=0 time=2 dim=0 state=0 grad_output=-0.008776 dX_4_temp=-0.030230 buffer_idx=8
+NS_BWD: batch=0 time=1 dim=0 state=0 grad_output=-0.060348 dX_4_temp=-0.207868 buffer_idx=4
+NS_BWD: batch=0 time=3 dim=0 state=0 grad_output=0.021267 dX_4_temp=0.073256 buffer_idx=12
+NS_BWD: batch=0 time=0 dim=0 grad_u_before=0.000000 partial_sum=0.081125
+NS_BWD: batch=0 time=2 dim=0 grad_u_before=0.000000 partial_sum=0.030216
+NS_BWD: batch=0 time=1 dim=0 grad_u_before=0.000000 partial_sum=0.027297
+NS_BWD: batch=0 time=3 dim=0 grad_u_before=0.000000 partial_sum=-0.003321
+NS_BWD: batch=0 time=0 dim=0 grad_u_after=0.081125
+NS_BWD: batch=0 time=2 dim=0 grad_u_after=0.030216
+NS_BWD: batch=0 time=1 dim=0 grad_u_after=0.027297
+NS_BWD: batch=0 time=3 dim=0 grad_u_after=-0.003321
+NS_BWD: batch=0 time=1 dim=0 grad_delta_before=0.000000 partial_sum=-5.451864
+NS_BWD: batch=0 time=0 dim=0 grad_delta_before=0.000000 partial_sum=1.131238
+NS_BWD: batch=0 time=3 dim=0 grad_delta_before=0.000000 partial_sum=-0.037268
+NS_BWD: batch=0 time=2 dim=0 grad_delta_before=0.000000 partial_sum=0.072464
+NS_BWD: batch=0 time=1 dim=0 grad_delta_after=-5.451864
+NS_BWD: batch=0 time=3 dim=0 grad_delta_after=-0.037268
+NS_BWD: batch=0 time=0 dim=0 grad_delta_after=1.131238
+NS_BWD: batch=0 time=2 dim=0 grad_delta_after=0.072464
+================================================================================
+COMPREHENSIVE CUDA vs PyTorch TEST SUITE
+================================================================================
+
+[Test 1/6]
+
+================================================================================
+Forward Test: batch=2, dim=4, seqlen=8, dstate=4
+  beta=0.0, alpha=1.0, variable_B=False, variable_C=False
+  complex=False, has_D=True
+================================================================================
+  ✅ output: Match (max_diff=2.980232e-08, mean_diff=2.851351e-09)
+
+[Test 2/6]
+
+================================================================================
+Forward Test: batch=2, dim=4, seqlen=8, dstate=4
+  beta=0.5, alpha=1.0, variable_B=False, variable_C=False
+  complex=False, has_D=True
+================================================================================
+  ❌ output: Mismatch (max_diff=7.558219e-03, mean_diff=9.331207e-04)
+     CUDA range: [-0.341489, 1.024503]
+     Torch range: [-0.341489, 1.024502]
+     Max diff at index (1, 2, 5)
+     CUDA value: 0.068189
+     Torch value: 0.075747
+
+[Test 3/6]
+
+================================================================================
+Forward Test: batch=2, dim=4, seqlen=16, dstate=4
+  beta=0.9, alpha=1.0, variable_B=False, variable_C=False
+  complex=False, has_D=True
+================================================================================
+  ❌ output: Mismatch (max_diff=1.817405e-02, mean_diff=2.728058e-03)
+     CUDA range: [-7.724799, 3.177478]
+     Torch range: [-7.727359, 3.177478]
+     Max diff at index (1, 3, 13)
+     CUDA value: 1.710969
+     Torch value: 1.729144
+
+[Test 4/6]
+
+================================================================================
+Forward Test: batch=2, dim=8, seqlen=8, dstate=4
+  beta=0.5, alpha=1.0, variable_B=True, variable_C=False
+  complex=False, has_D=True
+================================================================================
+  ✅ output: Match (max_diff=5.960464e-08, mean_diff=5.611582e-09)
+
+[Test 5/6]
+
+================================================================================
+Backward Test: batch=2, dim=4, seqlen=8, dstate=4
+  beta=0.5, alpha=1.0, variable_B=False, variable_C=False
+  complex=False, has_D=True
+================================================================================
+  ✅ du: Gradients computed (detached NS - exact match not expected)
+  ✅ ddelta: Gradients computed (detached NS - exact match not expected)
+  ✅ dA: Gradients computed (detached NS - exact match not expected)
+  ✅ dB: Gradients computed (detached NS - exact match not expected)
+  ✅ dC: Gradients computed (detached NS - exact match not expected)
+  ✅ dD: Gradients computed (detached NS - exact match not expected)
+
+[Test 6/6]
+
+================================================================================
+Backward Test: batch=2, dim=4, seqlen=16, dstate=4
+  beta=0.9, alpha=1.0, variable_B=False, variable_C=False
+  complex=False, has_D=True
+================================================================================
+  ✅ du: Gradients computed (detached NS - exact match not expected)
+  ✅ ddelta: Gradients computed (detached NS - exact match not expected)
+  ✅ dA: Gradients computed (detached NS - exact match not expected)
+  ✅ dB: Gradients computed (detached NS - exact match not expected)
+  ✅ dC: Gradients computed (detached NS - exact match not expected)
+  ✅ dD: Gradients computed (detached NS - exact match not expected)
+
+================================================================================
+TEST SUMMARY
+================================================================================
+Passed: 4/6
+  Test 1 (forward): ✅ PASS
+  Test 2 (forward): ❌ FAIL
+  Test 3 (forward): ❌ FAIL
+  Test 4 (forward): ✅ PASS
+  Test 5 (backward): ✅ PASS
+  Test 6 (backward): ✅ PASS
